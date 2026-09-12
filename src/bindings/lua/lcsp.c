@@ -1,6 +1,7 @@
 #include <csp/csp.h>
 #include <csp/csp_cmp.h>
 #include <csp/csp_debug.h>
+#include <csp/csp_hooks.h>
 #include <csp/drivers/usart.h>
 
 #include <csp/interfaces/csp_if_kiss.h>
@@ -15,6 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <inttypes.h>
+
+// Two-level macro for proper expansion
+#define STRINGIFY_IMPL(x) #x
+#define STRINGIFY(x) STRINGIFY_IMPL(x)
+#define S(x) STRINGIFY_IMPL(x)
+
+static void lcsp_push_conn_or_nil(lua_State *L, csp_conn_t *conn); // forward declaration
 
 #define lua_stack_dump(L) _lua_stack_dump(L, __func__, __LINE__)
 static void _lua_stack_dump(lua_State *L, const char *func, int line)
@@ -154,6 +163,44 @@ static int lcsp_print_interfaces(lua_State *L)
 }
 #endif /* CSP_ENABLE_CSP_PRINT */
 
+static int lcsp_clock_get_time(lua_State *L)
+{
+	csp_timestamp_t time;
+	csp_clock_get_time(&time);
+	lua_pushnumber(L, time.tv_sec + (time.tv_nsec / (lua_Number)NSEC_PER_SEC));
+	return 1;
+}
+
+static int lcsp_clock_set_time(lua_State *L)
+{
+	lua_Number n = luaL_checknumber(L, 1);
+	csp_timestamp_t time;
+
+	double i, f = modf(n, &i);
+	time.tv_sec = (uint32_t)n;
+	time.tv_nsec = (uint32_t)(f * NSEC_PER_SEC);
+
+	int r = csp_clock_set_time(&time);
+	lua_pushboolean(L, r == CSP_ERR_NONE);
+	return 1;
+}
+
+static uint16_t lcsp_checkaddress(lua_State *L, int arg)
+{
+	int addr = luaL_checkinteger(L, arg);
+	if (0 <= addr && addr <= 0xFFFF)
+		return addr;
+	return luaL_argerror(L, arg, "address out of range (0 .. 65535)");
+}
+
+static uint16_t lcsp_checknetmask(lua_State *L, int arg)
+{
+	int netmask = luaL_checkinteger(L, arg);
+	if (0 <= netmask && netmask <= 0xFFFF)
+		return netmask;
+	return luaL_argerror(L, arg, "netmask out of range (0 .. 65535)");
+}
+
 static csp_conn_t *lcsp_check_conn(lua_State *L, int ud);
 static csp_packet_t *lcsp_check_packet(lua_State *L, int ud);
 
@@ -243,6 +290,15 @@ static void lcsp_push_packet(lua_State *L, csp_packet_t *packet)
 	luaL_setmetatable(L, "csp_packet_t");
 }
 
+static void lcsp_push_packet_or_nil(lua_State *L, csp_packet_t *packet)
+{
+	if (packet != NULL) {
+		lcsp_push_packet(L, packet);
+	} else {
+		lua_pushnil(L);
+	}
+}
+
 static csp_packet_t *lcsp_check_packet(lua_State *L, int ud)
 {
 	csp_packet_t **ptr = luaL_checkudata(L, ud, "csp_packet_t");
@@ -261,13 +317,32 @@ static int lcsp_packet_index(lua_State *L)
 	csp_packet_t *packet = lcsp_check_packet(L, 1);
 	const char *member = luaL_checkstring(L, 2);
 
-	if (strcmp(member, "length") == 0) {
-		lua_pushinteger(L, packet->length);
+	if (strcmp(member, "data") == 0) {
+		lua_pushlstring(L, (const char *)packet->data, packet->length);
 		return 1;
 	}
 
-	if (strcmp(member, "data") == 0) {
-		lua_pushlstring(L, (const char *)packet->data, packet->length);
+#define maybe_push_packet_field(T,F) \
+	if (strcmp(member, #F) == 0) { \
+		lua_push##T(L, packet -> F); \
+		return 1; \
+	}
+
+	maybe_push_packet_field(integer, length);
+	maybe_push_packet_field(integer, timestamp_tx);
+	maybe_push_packet_field(integer, timestamp_rx);
+	maybe_push_packet_field(integer, rx_count);
+	maybe_push_packet_field(integer, remain);
+
+#undef maybe_push_packet_field
+
+	if (strcmp(member, "conn") == 0) {
+		lcsp_push_conn_or_nil(L, packet->conn);
+		return 1;
+	}
+
+	if (strcmp(member, "next") == 0) {
+		lcsp_push_packet_or_nil(L, packet->next);
 		return 1;
 	}
 
@@ -286,11 +361,105 @@ static int lcsp_packet_gc(lua_State *L)
 	return 0;
 }
 
+static void lcsp_push_iface(lua_State *L, csp_iface_t *iface)
+{
+	csp_iface_t **ptr = lua_newuserdatauv(L, sizeof(*ptr), 0);
+	*ptr = iface;
+	luaL_setmetatable(L, S(csp_iface_t));
+}
+
+static void lcsp_push_iface_or_nil(lua_State *L, csp_iface_t *iface)
+{
+	if (iface) {
+		lcsp_push_iface(L, iface);
+	} else {
+		lua_pushnil(L);
+	}
+}
+
+static csp_iface_t *lcsp_check_iface(lua_State *L, int ud)
+{
+	csp_iface_t **ptr = luaL_checkudata(L, ud, S(csp_iface_t));
+	if (*ptr == NULL)
+		luaL_error(L, "invalid interface object");
+	return *ptr;
+}
+
+static int lcsp_iface_index(lua_State *L)
+{
+	/* first, look in metatable */
+	if (lcsp_getmetafield(L, 1, 2))
+		return 1;
+
+	/* second, look for members */
+	csp_iface_t *iface = lcsp_check_iface(L, 1);
+	const char *member = luaL_checkstring(L, 2);
+
+#define maybe_push_iface_member(M) \
+	if (strcmp(member, #M) == 0) { \
+		lua_pushinteger(L, csp_iface_##M(iface)); \
+		return 1; \
+	}
+
+	// no members here
+
+#undef maybe_push_iface_member
+
+#define maybe_push_iface_field(T,F) \
+	if (strcmp(member, #F) == 0) { \
+		lua_push##T(L, iface -> F); \
+		return 1; \
+	}
+
+	maybe_push_iface_field(string, name);
+	maybe_push_iface_field(integer, addr);
+	maybe_push_iface_field(integer, netmask);
+	maybe_push_iface_field(boolean, is_default);
+
+#undef maybe_push_iface_field
+
+#define push_iface_stats_field(F) \
+		lua_pushinteger(L, iface -> F); \
+		lua_setfield(L, -2, #F);
+
+	if (strcmp(member, "stats")) {
+		lua_newtable(L);
+		push_iface_stats_field(tx);
+		push_iface_stats_field(rx);
+		push_iface_stats_field(tx_error);
+		push_iface_stats_field(rx_error);
+		push_iface_stats_field(autherr);
+		push_iface_stats_field(frame);
+		push_iface_stats_field(txbytes);
+		push_iface_stats_field(rxbytes);
+		push_iface_stats_field(irq);
+		return 1;
+	}
+
+#undef push_iface_stats_field
+
+	if (strcmp(member, "next")) {
+		lcsp_push_iface(L, iface->next);
+		return 1;
+	}
+
+	return 0;
+}
+
 static void lcsp_push_conn(lua_State *L, csp_conn_t *conn)
 {
 	csp_conn_t **ptr = lua_newuserdatauv(L, sizeof(*ptr), 0);
 	*ptr = conn;
 	luaL_setmetatable(L, "csp_conn_t");
+}
+
+static void lcsp_push_conn_or_nil(lua_State *L, csp_conn_t *conn)
+{
+	if (conn != NULL) {
+		lcsp_push_conn(L, conn);
+	} else {
+		lua_pushnil(L);
+	}
 }
 
 static csp_conn_t *lcsp_check_conn(lua_State *L, int ud)
@@ -560,6 +729,154 @@ static int lcsp_buffer_free(lua_State *L)
     return lcsp_packet_gc(L); // Re-use GC logic (handles NULL checks)
 }
 
+static int lcsp_buffers_remaining(lua_State *L)
+{
+	lua_pushinteger(L, csp_buffer_remaining());
+	return 1;
+}
+
+static int lcsp_promisc_enable(lua_State *L)
+{
+	unsigned int queue_size = luaL_checkinteger(L, 1);
+	int r = csp_promisc_enable(queue_size);
+	lua_pushboolean(L, r == CSP_ERR_NONE);
+	lua_pushinteger(L, r);
+	return 2;
+}
+
+static int lcsp_promisc_disable(lua_State *L)
+{
+	csp_promisc_disable();
+	return 0;
+}
+
+static int lcsp_promisc_read(lua_State *L)
+{
+	int timeout = luaL_checkinteger(L, 1);
+	csp_packet_t * packet = csp_promisc_read(timeout);
+	lcsp_push_packet_or_nil(L, packet);
+	return 1;
+}
+
+
+static int lcsp_iflist_get_by_name(lua_State *L)
+{
+	const char *name = luaL_checkstring(L, 1);
+
+	csp_iface_t *iface = csp_iflist_get_by_name(name);
+
+	lcsp_push_iface_or_nil(L, iface);
+	return 1;
+}
+static int lcsp_iflist_get_by_addr(lua_State *L)
+{
+	uint16_t addr = lcsp_checkaddress(L, 1);
+
+	csp_iface_t *iface = csp_iflist_get_by_addr(addr);
+
+	lcsp_push_iface_or_nil(L, iface);
+	return 1;
+}
+static int lcsp_iflist_get_by_broadcast(lua_State *L)
+{
+	uint16_t addr = lcsp_checkaddress(L, 1);
+
+	csp_iface_t *iface = csp_iflist_get_by_broadcast(addr);
+
+	lcsp_push_iface_or_nil(L, iface);
+	return 1;
+}
+static int lcsp_iflist_get_by_subnet(lua_State *L)
+{
+	uint16_t addr = lcsp_checkaddress(L, 1);
+
+	csp_iface_t *iface = luaL_opt(L, lcsp_check_iface, 2, NULL);
+
+	iface = csp_iflist_get_by_subnet(addr, iface);
+
+	lcsp_push_iface_or_nil(L, iface);
+	return 1;
+
+}
+static int lcsp_iflist_get_by_isdfl(lua_State *L)
+{
+	csp_iface_t *iface = luaL_opt(L, lcsp_check_iface, 1, NULL);
+
+	iface = csp_iflist_get_by_isdfl(iface);
+
+	lcsp_push_iface_or_nil(L, iface);
+	return 1;
+}
+
+static int lcsp_iflist_get_by_index(lua_State *L)
+{
+	int idx = luaL_checkinteger(L, 1);
+
+	csp_iface_t *iface = csp_iflist_get_by_index(idx);
+
+	lcsp_push_iface_or_nil(L, iface);
+	return 1;
+}
+
+// Iterator step function: called on each loop iteration
+static int lcsp_iflist_iter(lua_State *L)
+{
+    // Arg 1: Invariant state (unused)
+    // Arg 2: Control variable (previous csp_iface_t object, or nil on 1st iteration)
+    csp_iface_t *prev = luaL_opt(L, lcsp_check_iface, 2, NULL);
+
+    csp_iface_t *next = csp_iflist_iterate(prev);
+
+    if (next == NULL)
+        return 0; // Terminate loop
+
+    lcsp_push_iface(L, next);
+    return 1;
+}
+
+// Factory function: called when 'in csp.interfaces()' is executed
+static int lcsp_interfaces(lua_State *L)
+{
+    lua_pushcfunction(L, lcsp_iflist_iter); // Iterator function
+    lua_pushnil(L);                         // Invariant state
+    lua_pushnil(L);                         // Initial control variable
+    return 3;
+}
+
+static int lcsp_iface_tostring(lua_State *L)
+{
+	csp_iface_t *i = lcsp_check_iface(L, 1);
+
+	char tx_postfix, rx_postfix;
+	unsigned long tx = csp_bytesize(i->txbytes, &tx_postfix);
+	unsigned long rx = csp_bytesize(i->rxbytes, &rx_postfix);
+
+	luaL_Buffer B;
+	luaL_buffinit(L, &B);
+
+	char *buf = luaL_prepbuffsize(&B, LUAL_BUFFERSIZE);
+
+	int len = snprintf(buf, LUAL_BUFFERSIZE,
+	    "%-10s addr: %"PRIu16" netmask: %"PRIu16" dfl: %" PRIu32 "\r\n"
+	    "           tx: %05" PRIu32 " rx: %05" PRIu32 " txe: %05" PRIu32 " rxe: %05" PRIu32 "\r\n"
+	    "           drop: %05" PRIu32 " autherr: %05" PRIu32 " frame: %05" PRIu32 "\r\n"
+	    "           txb: %" PRIu32 " (%" PRIu32 "%c) rxb: %" PRIu32 " (%" PRIu32 "%c)",
+	    i->name, i->addr, i->netmask, i->is_default, i->tx, i->rx, i->tx_error, i->rx_error, i->drop,
+	    i->autherr, i->frame, i->txbytes, tx, tx_postfix, i->rxbytes, rx, rx_postfix);
+
+	if (len < 0) {
+ 		return luaL_error(L, "string formatting error in snprintf");
+	} else if (len >= LUAL_BUFFERSIZE) {
+		// Clamp to actual written characters
+		len = LUAL_BUFFERSIZE - 1;
+	}
+
+	luaL_addsize(&B, len);
+	luaL_pushresult(&B);
+	return 1;
+}
+
+
 
 static int lcsp_ping(lua_State *L)
 {
@@ -688,6 +1005,10 @@ static int lcsp_udp_init(lua_State *L)
 	int remote_port = luaL_checkinteger(L, 2);
 	int listen_port = luaL_checkinteger(L, 3);
 
+	uint16_t addr = luaL_opt(L, lcsp_checkaddress, 4, 0);
+	uint16_t netmask = luaL_opt(L, lcsp_checknetmask, 5, 0);
+	int is_default = luaL_opt(L, lua_toboolean, 6, false);
+
 	csp_iface_t *iface;
 	csp_if_udp_conf_t *udp_conf;
 
@@ -699,6 +1020,11 @@ static int lcsp_udp_init(lua_State *L)
 	udp_conf->rport = remote_port;
 
 	csp_if_udp_init(iface, udp_conf);
+
+	iface->addr = addr;
+	iface->netmask = netmask;
+	iface->is_default = !!is_default;
+
 	return 0;
 }
 
@@ -732,10 +1058,15 @@ static int lcsp_kiss_init(lua_State *L)
 	return 1;
 }
 
+static int lcsp_set_dbg_packet_print(lua_State *L)
+{
+	csp_dbg_packet_print = lua_toboolean(L, 1);
+	return 0;
+}
 
 static const struct luaL_Reg lcsp_socket_methods[] = {
 	{"__gc", lcsp_socket_gc},
-	
+
 	{ NULL, NULL } /* sentinel */
 };
 
@@ -751,7 +1082,7 @@ static const struct luaL_Reg lcsp_conn_methods[] = {
 
 	{"__index", lcsp_conn_index},
 	{"__gc", lcsp_conn_gc},
-	
+
 	{ NULL, NULL } /* sentinel */
 };
 
@@ -766,6 +1097,11 @@ static const struct luaL_Reg lcsp_packet_methods[] = {
 	{ NULL, NULL } /* sentinel */
 };
 
+static const struct luaL_Reg lcsp_iface_methods[] = {
+	{"__index", lcsp_iface_index},
+	{"__tostring", lcsp_iface_tostring},
+	{ NULL, NULL } /* sentinel */
+};
 
 static const luaL_Reg lcsp_functions[] = {
     {"init", lcsp_init},
@@ -789,12 +1125,32 @@ static const luaL_Reg lcsp_functions[] = {
 
     {"buffer_free", lcsp_buffer_free},
     {"buffer_get", lcsp_buffer_get},
+    {"buffers_remaining", lcsp_buffers_remaining},
 
     {"packet_get_length", lcsp_packet_get_length},
     {"packet_get_data", lcsp_packet_get_data},
     {"packet_set_data", lcsp_packet_set_data},
 
 	{"cmp_ident", lcsp_cmp_ident},
+
+	{"udp_init", lcsp_udp_init},
+
+	{"iflist_get_by_name", lcsp_iflist_get_by_name},
+	{"iflist_get_by_addr", lcsp_iflist_get_by_addr},
+	{"iflist_get_by_broadcast", lcsp_iflist_get_by_broadcast},
+	{"iflist_get_by_subnet", lcsp_iflist_get_by_subnet},
+	{"iflist_get_by_isdfl", lcsp_iflist_get_by_isdfl},
+	{"iflist_get_by_index", lcsp_iflist_get_by_index},
+	{"interfaces", lcsp_interfaces}, // iterate over all interfaces
+
+	{"set_dbg_packet_print", lcsp_set_dbg_packet_print},
+
+	{"clock_get_time", lcsp_clock_get_time},
+	{"clock_set_time", lcsp_clock_set_time},
+
+	{"promisc_enable", lcsp_promisc_enable},
+	{"promisc_disable", lcsp_promisc_disable},
+	{"promisc_read", lcsp_promisc_read},
 
 //#ifdef CSP_USE_RTABLE
 //	{"rtable_set", lcsp_rtable_set},
@@ -811,33 +1167,41 @@ static const luaL_Reg lcsp_functions[] = {
 
 #ifdef __linux__
 	{"sleep", lcsp_sleep},
-#endif    
-    
+#endif
+
     {NULL, NULL}  /* sentinel */
 };
 
 int luaopen_csp(lua_State *L) {
+
 	/* Register metatable for the 'csp_socket_t' objects */
-	if (luaL_newmetatable(L, "csp_socket_t")) {
+	if (luaL_newmetatable(L, S(csp_socket_t))) {
 		luaL_setfuncs(L, lcsp_socket_methods, 0);   /* add 'csp_socket_t' methods to the new metatable */
 		lua_setfield(L, -1, "__index");             /* metatable.__index = metatable */
 	}
 
 	/* Register metatable for the 'csp_conn_t' objects */
-	if (luaL_newmetatable(L, "csp_conn_t")) {       /* create metatable to handle 'csp_conn_t' objects */
+	if (luaL_newmetatable(L, S(csp_conn_t))) {       /* create metatable to handle 'csp_conn_t' objects */
 		luaL_setfuncs(L, lcsp_conn_methods, 0);     /* add 'csp_conn_t' methods to the new metatable */
 		lua_pop(L, 1);                              /* pop new metatable off the stack */
 		//lua_setfield(L, -1, "__index");             /* metatable.__index = metatable */
 	}
 
 	/* Register metatable for the 'csp_packet_t' objects */
-	if (luaL_newmetatable(L, "csp_packet_t")) {     /* create metatable to handle 'csp_packet_t' objects */
+	if (luaL_newmetatable(L, S(csp_packet_t))) {     /* create metatable to handle 'csp_packet_t' objects */
 		luaL_setfuncs(L, lcsp_packet_methods, 0);   /* add 'csp_packet_t' methods to the new metatable */
 		lua_pop(L, 1);                              /* pop new metatable off the stack */
 		//lua_setfield(L, -1, "__index");             /* metatable.__index = metatable */
 	}
 
-    luaL_newlib(L, lcsp_functions);
+	/* Register metatable for the 'csp_iface_t' objects */
+	if (luaL_newmetatable(L, S(csp_iface_t))) {    /* create metatable to handle 'csp_iface_t' objects */
+		luaL_setfuncs(L, lcsp_iface_methods, 0);   /* add 'csp_iface_t' methods to the new metatable */
+		lua_pop(L, 1);                             /* pop new metatable off the stack */
+		//lua_setfield(L, -1, "__index");             /* metatable.__index = metatable */
+	}
+
+	luaL_newlib(L, lcsp_functions);
 
 	lua_pushstring(L, "libcsp");
 	lua_setfield(L, -2, "_NAME");
