@@ -191,7 +191,12 @@ endif()
 configure_file(csp_autoconfig.h.in include/csp/autoconfig.h)
 
 if(NOT CSP_ZEPHYR)
-  install(TARGETS csp LIBRARY COMPONENT runtime)
+  include(GNUInstallDirs)
+  install(TARGETS csp
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    COMPONENT runtime)
   install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/;${CMAKE_CURRENT_SOURCE_DIR}/include/;
     TYPE INCLUDE
     FILES_MATCHING PATTERN "*.h*"
